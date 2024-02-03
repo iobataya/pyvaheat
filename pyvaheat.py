@@ -414,4 +414,9 @@ class Vaheat:
         corrected_s = reversed_s.replace(',', '', 1)
         # Reverse the string back to original order
         return corrected_s[::-1]
-      
+
+    def __str__(self):
+        if self.serial.is_open:
+            return 'VAHEAT ({self.port}, connected)'
+        else:
+            return 'VAHEAT ({self.port}, not connected)'
