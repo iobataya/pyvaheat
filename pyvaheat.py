@@ -4,8 +4,15 @@ import serial
 from serial.tools import list_ports
 import signal
 import sys
-import time
+import re
 from typing import List, Dict
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+ch = logging.StreamHandler()
+logger.addHandler(ch)
+formatter_iso8601 = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%dT%H:%M:%S')
+ch.setFormatter(formatter_iso8601)
 
 class Vaheat:
     """
@@ -40,7 +47,7 @@ class Vaheat:
         "disconnect":None,
         "port":"ex. COM3, /dev/ttyUSB*, /dev/ttyACM*",
         "baud_rate":"9600, 14400, 19200, 38400, 57600, 115200, 230400, 460800, 921600",
-        "start_streaming":"once or continuous",
+        "start_streaming":"once or continuous (str)",
         "raw":None,
         "read":None,
         "read_all":None,
@@ -70,12 +77,13 @@ class Vaheat:
         self.info = None
         self.read_raw = ''
         self.write_raw = ''
+        self.error = ''
 
     def connect(self) -> bool:
         """Open the serial connection."""
         if self.port is None:
             devices = Vaheat.find_ports()
-            if len(devices) == 0:
+            if not devices:
                 raise OSError("No connected VAHEAT devices.")
             if len(devices) >= 1:
                 self.port = devices[0]
@@ -98,16 +106,25 @@ class Vaheat:
 
     def get_info(self) -> dict:
         """The get_info command will reply with information about your device."""
-        self.info = self._get('get_info')['data']
-        return self.info
+        info = self._get('get_info')
+        if info:
+            self.info = info['data']
+            return self.info
+        return None
 
     def get_status(self) -> dict:
         """The get_status command will repoly with information about the status of your device."""
-        return self._get('get_status')['data']
+        status = self._get('get_status')
+        if status:
+            return status['data']
+        return None
 
     def get_settings(self) -> dict:
         """The get_settings command will repoly with the settings stored on your device."""
-        return self._get('get_settings')['data']
+        settings = self._get('get_settings')
+        if settings:
+            return settings['data']
+        return None
     
     def get_streaming(self) -> dict:
         """
@@ -122,6 +139,8 @@ class Vaheat:
         # Manipulate raw string
         corrected = self._add_commas(raw_str)
         response = self._json2dict(corrected)
+        if response is None:
+            return None
         response['data']['rate'] = int(response['data']['rate'])  # type(rate) should be int
         return response['data']
 
@@ -134,37 +153,50 @@ class Vaheat:
             config (dict): dict of parameters
         
         Note:
+            ! Since current VAHEAT device returns wrong JSON format missing comma, raw string is manupilated.
+
             keys and paramters
             profile_number (int): Number of profile
             step (int, optional): Number of step
         """
-        if len(config) == 0:
+        if not config or not 'profile_number' in config:
             return None
-        cmd = self._json_str('get_profile', data=config)
-        self.write(cmd)
-        response = self._json2dict(self.read_all_lines())
-        if self._is_success(response):
-            return response
-        return None
+        self.write(self._json_str('get_profile', data=config))
+        raw_str = self.read_all_lines()
+        # When profile number is specified, correction is needed.
+        if 'step' in config:
+            corrected = self._add_commas(raw_str)
+            response = self._json2dict(corrected)
+        else:
+            response = self._json2dict(raw_str)
+        if not response:
+            return None
+        return response['data']
 
-    def start_heating(self, config) -> dict:
+    def start_heating(self, config) -> bool:
         """
-        The 'star_heating' command allows you to change the operating mode
+        The 'start_heating' command allows you to change the operating mode
         of the device and start the heating process.
 
+        Returns:
+            bool: success
         Args:
             config (dict): dict of parameters
         
         Note:
             keys and parameters
-            mode                     (str): Device mode. (AUTO/DIRECT/SHOCK/PROFILE)
+            mode                     (str): Device mode. (AUTO/DIRECT/SHOCK/PROFILE), default: auto
             power        (float, optional): Relative power (%) in DIRECT and SHOCK mode. Defaults 0.1%
             temperature  (float, optional):Temperature setoing in AUTO mode. Defaults 25 degC.
             duration     (float, optional): Shock duration in SHOCK mode [0.1-9999]
             profile_number (int, optional): Profile selection [1-9] in PROFILE mode. Defaults -1
         """
-        if len(config) == 0:
-            return None
+        if not config:
+            return False
+        alarm = self.get_alarm()
+        if not alarm or alarm != "NO_ALARM":
+            logging.error(f"ALARM status: {alarm}. Check hardware.")
+            return False
         mode = config.get('mode','auto')
         d = {'mode':mode}
         if mode.lower() == 'auto':
@@ -182,18 +214,23 @@ class Vaheat:
             if 'profile_number' in config:
                 profile_number = config['profile_number']
                 if profile_number < 1 or profile_number > 9:
-                    raise ValueError("Profile number should be 1-9.")
+                    logging.error(f"Profile number exceeded. {profile_number}")
+                    return False
                 d['profile_number'] = profile_number
             if 'ignore_limit_error':
                 d['ignore_limit_error'] = config['ignore_limit_error']
-        else:
-            raise ValueError(f"Mode {mode} is not allowed.")
-        self.write(self._json_str('start_heating',data=d))
 
-        response = self._json2dict(self.read_all_lines())
-        if self._is_success(response):
+        self.write(self._json_str('start_heating',data=d))
+        if self._is_success(self._json2dict(self.read_all_lines())):
             logging.info(f"Heating started by {mode} mode.")
-            return response
+            return True
+        return False
+
+    def get_alarm(self) -> str:
+        """Return current alarm condition"""
+        status = self.get_status()
+        if status:
+            return status['alarm']
         return None
 
     def stop_heating(self) -> bool:
@@ -210,10 +247,12 @@ class Vaheat:
         Args:
             mode (str, optional): continuous or once
         """
+        alarm = self.get_alarm()
+        if not alarm or alarm != "NO_ALARM":
+            logging.error(f"ALARM status: {alarm}. Check hardware.")
+            return False
         if mode == 'continuous' or mode == 'once':
-            conf = self.get_streaming()
-            conf['mode'] = mode
-            return self.set_streaming(conf)
+            return self.set_streaming({'mode':mode})
         else:
             return False
 
@@ -221,18 +260,16 @@ class Vaheat:
         """
         Stop streaming
         """
-        self.serial.reset_input_buffer()
-        conf = self.get_streaming()
-        conf['mode'] = 'off'
-        return self.set_streaming(conf)
+        return self.set_streaming({'mode':'off'})
 
-    def do_reset(self, config) -> None:
+    def do_reset(self, config:dict) -> bool:
         """
         do_reset command allows you to reset parts of your device.
         
+        Returns:
+            bool: succeeded
         Args:
             config (dict): configs where to be reset.
-        
         Note:
             keys and parameters
             all           (bool): Reset everything
@@ -260,10 +297,11 @@ class Vaheat:
         """
         self.write(self._json_str('set_keylock', data=keylock))
         success = self._is_success(self._json2dict(self.read_all_lines()))
-        if keylock:
-            logging.info(f"Device is key-locked.")
-        else:
-            logging.info(f"Device is key-unlocked.")
+        if success:
+            if keylock:
+                logging.info(f"Device is key-locked.")
+            else:
+                logging.info(f"Device is key-unlocked.")
         return success
 
     def set_settings(self, config:dict) -> bool:
@@ -285,14 +323,13 @@ class Vaheat:
                 i               (int): I-gain, defaults to 70.
                 d               (int): D-gain, defaults to 0.
         """
-        if len(config) == 0:
+        if not config:
             return False
-        cmd = self._command_str('set_settings', data=config)
+        cmd = self._json_str('set_settings', data=config)
         self.write(cmd)
-        self._is_success(self._json2dict(self.read_all_lines()))
-        return True
+        return self._is_success(self._json2dict(self.read_all_lines()))
 
-    def set_streaming(self, config):
+    def set_streaming(self, config:dict) -> bool:
         """
         set_streaming command allows you to change the streaming settings stored on your device.
         The dictionary is avaiable get_settings()
@@ -314,12 +351,11 @@ class Vaheat:
             profile_step (bool): Active number and step of the profile
             resistance   (bool): sensor resistance in Ohm
         """
-        if len(config)==0:
+        if not config:
             return False
         cmd = self._json_str('set_streaming', data=config)
         self.write(cmd)
-        self._is_success(self._json2dict(self.read_all_lines()))
-        return True
+        return self._is_success(self._json2dict(self.readline()))
 
     def set_mode(self, config) -> bool:
         """
@@ -358,7 +394,8 @@ class Vaheat:
         else:
             raise ValueError(f"Mode {mode} is not allowed.")
         self.write(self._json_str('set_mode', data=d))
-        return self._is_success(self._json2dict(self.read_all_lines()))
+        response = self._json2dict(self.read_all_lines())
+        return response and self._is_success(response)
 
     def set_profile(self, profile) -> bool:
         """
@@ -378,7 +415,7 @@ class Vaheat:
                     setpoint (float): Setpoint to hold in this step.
                 },]
         """
-        if len(profile) == 0:
+        if not profile:
             return None
         self.write(self._json_str('set_profile',profile))
         return self._is_success(self._json2dict(self.read_all_lines()))
@@ -386,13 +423,12 @@ class Vaheat:
     def _json2dict(self, json_str:str) -> dict:
         """Try to convert from JSON str to dict"""
         try:
-            d = json.loads(json_str)
-            return d
+            return json.loads(json_str)
         except json.JSONDecodeError as e:
-            logging.info(f"JSON decoding error: {e.msg} at {e.pos}\nInput data: {e.doc}")
-            raise ValueError(e.msg)
+            logging.warning(f"JSON decoding error: {e.msg} at {e.pos}\nInput data: {e.doc}")
+            return None
 
-    def read(self) -> str:
+    def readline(self) -> str:
         """
         Read a JSON line from the serial port buffer.
 
@@ -402,12 +438,11 @@ class Vaheat:
         if self.serial and self.serial.is_open:
             try:
                 json_str = self.serial.readline().decode('utf-8').rstrip()
-                logging.debug(f"Read:\n{json_str}")
+                self.read_raw = json_str
                 return json_str
             except Exception as e:
-                print(f"Error reading data: {e}")
-        logging.debug("Nothing read.")
-        return ""
+                logging.error(f"Error in reading data: {e}")
+        return ''
 
     def read_all_lines(self) -> str:
         """
@@ -425,29 +460,35 @@ class Vaheat:
                         break  # No more data, exit loop
                     lines += l
                 json_str = lines.rstrip()
-                logging.debug(f"Read:\n{json_str}")
                 self.read_raw = json_str
                 return json_str
             except Exception as e:
-                logging.error(f"Error reading all lines: {e}")
-        logging.debug("Nothing read.")
-        return ""
+                logging.error(f"Error in reading all lines: {e}")
+        return ''
 
-    def write(self, json_str) -> None:
+    def write(self, json_str) -> bool:
         """
         Write JSON string to the serial port.
 
         Args:
             data (str): JSON string to write
+        
+        Returns:
+            bool: Data sent
         """
+        if not json_str:
+            return False
         if self.serial and self.serial.is_open:
             self.write_raw = json_str
             try:
                 self.serial.write(json_str.encode())
-                logging.debug(f"Wrote:\n{json_str}")
+                return True
             except Exception as e:
-                print(f"Error writing data: {e}")
-
+                logging.error(f"Error in writing data: {e}")
+        else:
+            logging.error("Device is not connected.")
+        return False
+    
     def _get(self, cmd) -> dict:
         """
         Get response after writing cmd
@@ -456,13 +497,13 @@ class Vaheat:
             cmd(str): string of command
         """
         if self.serial and self.serial.is_open:
-            self.write(self._json_str(cmd))  # Write get_XXX without data
-            data = self._json2dict(self.read_all_lines())  # Read data in buffer as dict
-            return data
+            if self.write(self._json_str(cmd)):  # Write get_XXX without data
+                data = self._json2dict(self.read_all_lines())  # Read data in buffer as dict
+                return data
         else:
             msg = "Connection is not open."
             logging.error(msg)
-            raise OSError(msg)
+        return None
 
     def _is_success(self, d:dict) -> bool:
         """
@@ -474,13 +515,16 @@ class Vaheat:
         Returns:
             bool: Success
         """
-        if 'success' in d and ['success'] == False:
+        if not d:  # None or empty dict
+            return False
+        if 'success' in d and not d['success']:
+            logging.error(d)
+            self.error = str(d)
             return False
         if 'error' in d:
-            print(d)
-            msg = f"Error: {d['error']}, Code:{d['code']}, Parent:{d['parent']} at {d['at']}"
-            logging.error(msg)
-            raise OSError(msg)
+            logging.error(d)
+            self.error = str(d)
+            return False
         return True
 
     def _json_str(self, cmd:str, data=None) -> str:
@@ -492,15 +536,11 @@ class Vaheat:
             data (dict, optional): Parameters dict. Defaults to None sending 'true' as value
 
         Returns:
-            str: Encoded JSON string
-
-        Raises:
-            ValueError: Command is not allowed
+            str: Encoded JSON string. Returns None when cmd is not in API_CMD.
         """
         if cmd not in self.API_CMD:
-            m = f'{cmd} is not in allowed commands.'
-            logging.error(m)
-            raise ValueError(m)
+            logging.error("command not allowed.")
+            return None
         if data is None:
             data = True
         return json.dumps({cmd:data})
@@ -531,12 +571,13 @@ class Vaheat:
         Current VAHEAT device respond irregular JSON format missing commas by 'get_streaming' command
         """
         # Splitting the string into lines
+        pat = ".*[{}:\[\]]$"
         lines = json_string.split('\n')
         corrected_lines = []
         for line in lines:
             stripped_line = line.strip()
             # Check if the line ends with an opening or closing brace, or contains "data:":
-            if stripped_line and not stripped_line.endswith('{') and not stripped_line.endswith('}') and not stripped_line.endswith('":'):
+            if stripped_line and not re.search(pat, stripped_line):
                 # Add a comma at the end if it's missing
                 if not stripped_line.endswith(','):
                     line = line.rstrip() + ','
@@ -602,18 +643,14 @@ def _input_params(msg="") -> dict:
         dict: parameters from JSON string
     """
     try:
-        print(f"Parameters: ({msg})")
-        s = input("JSON: ")
-        if len(s)==0:
-            return {}
-        data = _vh._json2dict(s)
-        str_json = json.dumps(data)
-        if len(data) > 0:
-            print(f"Sending paremeter is : {str_json}")
-            return data
+        if msg:
+            print(msg)
+        s = input(prompt(input_type=f'JSON'))
+        ss = s.replace("'",'"').replace("True","true").replace("False","false")
+        return _vh._json2dict(ss)
     except EOFError:
-        _do_exit()
-    return {}
+        logging.error("EOF error with {s}")
+    return None
 
 def port():
     """Change Port name"""
@@ -643,7 +680,7 @@ def start_heating():
 
 def start_streaming() -> bool:
     """Start streaming by CLI"""
-    return _vh.start_streaming(_input_params(msg="mode (once/continuous)"))
+    return _vh.start_streaming(input(prompt(input_type=Vaheat.CLI_CMD['start_streaming'])))
 
 def set_keylock() -> bool:
     """set_keylock by CLI"""
@@ -654,21 +691,23 @@ def set_keylock() -> bool:
         return _vh.set_keylock(False)
 
 def get_profile() -> bool:
-    num = input("Enter profile_number (1-9): ")
     config = {}
-    if 1 <= int(num) and int(num) <= 9:
-        config['profile_number'] = int(num)
-        print("Enter step (1-20) or 0 for without specify.")
-        step = input("Step (1-20): ")
-        if 1 <= int(step) and int(step) <=20:
-            config['step'] = int(step)
-        _vh.get_profile(config)
-        # TODO: get_profile再考、テスト　(;ﾟ∀ﾟ)=3ﾊｧﾊｧ
-    return False
+    num = input("Enter profile_number (1-9): ")
+    if not num.isdigit() or (not 1 <= int(num) <= 9):
+        return False 
+    config['profile_number'] = int(num)    
+
+    step = input("Step (1-20 or empty for all steps): ")
+    if not step:  # empty
+        return _vh.get_profile(config)
+    if step.isdigit() and (1 <= int(step) <= 20):
+        config['step'] = int(step)
+        return _vh.get_profile(config)
+    return None
 
 def set_settings() -> bool:
     """set_settings by CLI"""
-    return _vh.set_streaming(_input_params(msg=Vaheat.API_CMD["set_settings"]))
+    return _vh.set_settings(_input_params(msg=Vaheat.API_CMD["set_settings"]))
 
 def set_streaming() -> bool:
     """set_streaming by CLI"""
@@ -684,12 +723,16 @@ def set_profile() -> bool:
 
 def do_reset() -> bool:
     """do_reset by CLI"""
-    config = _input_params()
-    return _vh.do_reset(config)
+    print("Reset erases current parameters. Get & write down those parameters.")
+    yn = input("Are you sure to proceed reset ? (Y/[N])")
+    if yn.lower() == 'y':
+        _vh.do_reset(_input_params(msg=Vaheat.API_CMD["do_reset"]))
+    else:
+        return False
 
 def read() -> str:
     """Read raw line from buffer"""
-    return _vh.read()
+    return _vh.readline()
 
 def read_all() -> str:
     """Read all raw lines from buffer"""
@@ -699,6 +742,10 @@ def write() -> str:
     """Write raw line to device"""
     s = input("Enter JSON str to write: ")
     return _vh.write(s)
+
+def error() -> str:
+    """The latest error message"""
+    return _vh.error
 
 def unknown_command() -> str:
     """Unknown command"""
@@ -752,6 +799,7 @@ def main():
         "set_mode": set_mode,
         "set_profile": set_profile,
         "raw": toggle_raw,
+        "error": error,
         "read": read,
         "read_all": read_all,
         "write": write,
@@ -761,7 +809,7 @@ def main():
     while True:
         try:
             user_command = input(prompt())  # get command
-            if user_command=='':
+            if not user_command:
                 continue
             # Execute function defined in cli_commands. default func print message.
             action = cli_commands.get(user_command, unknown_command)
