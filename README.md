@@ -6,7 +6,7 @@ A Python wrapper class of serial controller and interactive CLI for VAHEAT contr
   * Install pyserial module by ```pip install pyserial``` if not installed yet.
 
 # Usage of CLI
-Run pyvaheat.py. Prompt ask commands for API like 'connect', 'start_heating' and 'get_info'.  First of all, connect to device. If serial port is not specified, program will detect connected VAHEAT automatically.
+Run pyvaheat.py. Prompt ask commands for API like 'connect', 'start_heating' and 'get_info'.  First of all, connect to device. If serial port is not specified, program will detect connected VAHEAT automatically. See also an wiki page for an example.
 ```
 >connect
 ```
@@ -19,8 +19,9 @@ After establishing connection, prompt should show a serial number of your device
 >stop_heating
 >exit
 ```
+
 # Usage of class
-Your python script can use VAHEAT device by importing Vaheat class.
+Your python script can use VAHEAT device by importing Vaheat class. See also an wiki page.
 
 ## 1. Import the Vaheat class
 ```python
