@@ -417,10 +417,11 @@ class Vaheat:
     def _json2dict(self, json_str:str) -> dict:
         """Try to convert from JSON str to dict"""
         try:
-            return json.loads(json_str)
+            if json_str:   
+                return json.loads(json_str)
         except json.JSONDecodeError as e:
             logging.warning(f"JSON decoding error: {e.msg} at {e.pos}\nInput data: {e.doc}")
-            return None
+        return None
 
     def readline(self) -> str:
         """
