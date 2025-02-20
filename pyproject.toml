@@ -9,7 +9,15 @@ description = "Wrapper class to control VAHEAT via serial communication"
 authors = [{ name = "Ikuo Obataya", email = "obataya@qd-japan.com" }]
 license = {text = "MIT License"}
 readme = "README.md"
-
-dependencies = [
-    "pyserial"
+keywords = ["vaheat", "remote", "usb",]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python"
 ]
+dependencies = ["pyserial"]
+requires-python = ">=3.8"
+[project.urls]
+Repository = "https://github.com/iobataya/pyvaheat.git"
+
+[tool.setuptools]
+packages = { find = { exclude = ["tests"] } }
